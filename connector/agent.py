@@ -42,7 +42,10 @@ def http_post(path, body, timeout=20):
     req = urllib.request.Request(
         BASE + path, method="POST",
         data=json.dumps(body).encode(),
-        headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+        headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json",
+                 # UA bawaan urllib (Python-urllib) diblokir Cloudflare (403) —
+                 # agent wajib memperkenalkan diri dengan UA sendiri.
+                 "User-Agent": "RuangNode-Agent/" + AGENT_VERSION})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
