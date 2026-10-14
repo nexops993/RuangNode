@@ -47,6 +47,11 @@ echo "Python    : $(python3 --version 2>&1)"
 # --- Docker (syarat Panel Bot di node ini) ---
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker belum ada — memasang Docker (syarat Panel Bot)..."
+  # Paket compose bawaan distro bisa bentrok file dengan plugin dari
+  # repo Docker resmi — singkirkan dulu bila ada agar pemasangan mulus.
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get remove -y docker-compose-v2 docker-compose >/dev/null 2>&1 || true
+  fi
   curl -fsSL https://get.docker.com | sh
 fi
 systemctl enable --now docker >/dev/null 2>&1 || true
