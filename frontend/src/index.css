@@ -101,3 +101,12 @@
   .resbar{height:7px;border-radius:5px;background:var(--accent-soft);overflow:hidden;margin-top:4px}
   .resbar i{display:block;height:100%;background:var(--accent)}
   .resline{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:8px;margin-top:7px;flex-wrap:wrap}
+  header.top .mark{cursor:pointer;padding:0}
+  .drawerwrap{position:fixed;inset:0;background:rgba(61,44,34,.45);z-index:70}
+  .drawer{position:absolute;top:0;left:0;bottom:0;width:min(330px,88vw);background:var(--bg);border-right:1px solid var(--line);padding:16px 14px;overflow-y:auto;box-shadow:var(--sh)}
+  .noderow{display:flex;gap:9px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 11px;margin-bottom:8px;cursor:pointer;box-shadow:var(--sh-sm)}
+  .noderow.act{outline:2px solid var(--accent)}
+  .noderow .nm{font-weight:700;font-size:14.5px}
+  .noderow .meta{font-size:12px;color:var(--muted)}
+  .overlay{position:fixed;inset:0;background:rgba(61,44,34,.45);z-index:80;display:flex;align-items:center;justify-content:center;padding:16px}
+  .sheet{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;max-width:520px;width:100%;box-shadow:var(--sh);max-height:88vh;overflow-y:auto}

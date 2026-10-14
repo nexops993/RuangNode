@@ -1,5 +1,5 @@
 import React, { useCallback, useContext, useEffect, useRef, useState } from "react";
-import { api, postJSON, fmtBytes, fmtPct, fmtUptime, fmtTemp } from "./api";
+import { api, postJSON, fmtBytes, fmtPct, fmtUptime, fmtTemp, setCurrentNode, getCurrentNode, downloadUrl } from "./api";
 import * as I from "./icons";
 import { UiCtx } from "./ui-context";
 import { BotsSection } from "./bots";
@@ -100,8 +100,54 @@ const TABS = [
 ];
 
 function Dashboard({ onLogout }) {
-  const { toast } = useUi();
+  const { toast, confirm } = useUi();
   const [tab, setTab] = useState("home");
+  const [nodeId, setNodeId] = useState(() => getCurrentNode());
+  const [drawer, setDrawer] = useState(false);
+  const [nodeList, setNodeList] = useState([]);
+  const [enroll, setEnroll] = useState(null);
+
+  const loadNodes = useCallback(async () => {
+    const { j } = await api("/api/nodes");
+    if (j && j.ok) setNodeList(j.data);
+  }, []);
+
+  useEffect(() => { if (drawer) loadNodes(); }, [drawer, loadNodes]);
+
+  function switchNode(n) {
+    setCurrentNode(n.id);
+    setNodeId(n.id);
+    setStatus(null);
+    setRefreshKey((k) => k + 1);
+    setDrawer(false);
+    toast("Node aktif: " + n.name);
+  }
+
+  async function genEnroll() {
+    const { r, j } = await postJSON("/api/nodes/enroll", { name: enroll.name });
+    if (r.ok) setEnroll({ ...enroll, command: j.data.command });
+    else toast("Gagal membuat perintah pemasangan");
+  }
+
+  function copyEnroll() {
+    const done = () => toast("Perintah disalin");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(enroll.command).then(done).catch(() => toast("Salin manual dari kotak teks"));
+    } else toast("Salin manual dari kotak teks");
+  }
+
+  function delNode(n) {
+    confirm("Hapus node " + n.name + "?",
+      "Node dicabut dari dashboard beserta metadata botnya di dashboard. Agent di mesin itu berhenti melapor (service ruangnode-agent di mesinnya bisa dimatikan manual). File di mesin itu tidak dihapus.",
+      async () => {
+        const { r } = await postJSON("/api/nodes/delete", { id: n.id });
+        if (r.ok) {
+          toast("Node dihapus");
+          if (n.id === nodeId) switchNode({ id: "local", name: "lokal" });
+          loadNodes();
+        } else toast("Gagal menghapus node");
+      });
+  }
   const [status, setStatus] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -125,7 +171,7 @@ function Dashboard({ onLogout }) {
     <div id="view-dash" style={{ display: "block" }}>
       <div className="wrap">
         <header className="top">
-          <div className="mark"><I.LogoIcon size={22} /></div>
+          <button className="mark" title="Ganti node" aria-label="Ganti node" onClick={() => setDrawer(true)}><I.LogoIcon size={22} /></button>
           <div>
             <h1>RuangNode</h1>
             <div className="sub">{status ? status.hostname : "Dashboard Web Untuk Linux"}</div>
@@ -146,6 +192,74 @@ function Dashboard({ onLogout }) {
         {tab === "svc" && <ServicesPane refreshKey={refreshKey} />}
         {tab === "sys" && <SystemPane status={status} />}
       </div>
+
+      {drawer && (
+        <div className="drawerwrap" onClick={() => setDrawer(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <b style={{ fontSize: 16, flex: 1 }}>Node Server</b>
+              <button className="btn sm ghost" onClick={() => setDrawer(false)}>Tutup</button>
+            </div>
+            <p className="muted" style={{ marginTop: 6 }}>
+              Status node yang aktif ditampilkan di halaman ini. Ketuk node lain untuk beralih — semua tab (Ringkasan, Penyimpanan, Aplikasi, Service, Sistem) mengikuti node aktif.
+            </p>
+            {nodeList.length === 0 && <p className="muted">Memuat daftar node...</p>}
+            {nodeList.map((n) => (
+              <div key={n.id} className={"noderow" + (n.id === nodeId ? " act" : "")} onClick={() => switchNode(n)}>
+                <span className={"dot " + (n.online ? "on" : "off")}></span>
+                <div className="grow">
+                  <div className="nm">{n.name}{n.kind === "local" ? " · mesin ini" : ""}</div>
+                  <div className="meta">{n.hostname || "belum melapor"}{n.os ? " · " + n.os : ""}</div>
+                  <div className="meta">
+                    {n.online
+                      ? "CPU " + fmtPct(n.cpu_pct) + " · RAM " + fmtPct(n.mem_pct) + (n.docker ? " · Docker siap" : " · tanpa Docker")
+                      : (n.last_seen ? "offline — terakhir " + new Date(n.last_seen * 1000).toLocaleString("id-ID") : "menunggu agent terpasang")}
+                  </div>
+                </div>
+                {n.kind === "agent" && (
+                  <button className="btn sm ghost" style={{ color: "#b23a2e" }}
+                    onClick={(e) => { e.stopPropagation(); delNode(n); }}>Hapus</button>
+                )}
+              </div>
+            ))}
+            <button className="btn" style={{ width: "100%", marginTop: 6 }}
+              onClick={() => setEnroll({ name: "", command: null })}>+ Add Connector</button>
+            <p className="muted" style={{ fontSize: 12.5 }}>
+              Hubungkan mesin Linux lain ke dashboard ini dengan satu perintah pemasangan. Mesin yang terhubung bisa dikelola penuh: status, file, service, dan bot.
+            </p>
+          </aside>
+        </div>
+      )}
+
+      {enroll && (
+        <div className="overlay" onClick={() => setEnroll(null)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 8px" }}>Add Connector</h3>
+            {!enroll.command ? (
+              <div>
+                <label className="muted">Nama node (bebas)</label>
+                <input className="field" value={enroll.name}
+                  onChange={(e) => setEnroll({ ...enroll, name: e.target.value })}
+                  placeholder="mis. VPS Utama" />
+                <button className="btn" style={{ width: "100%" }} onClick={genEnroll}>Buat Perintah Pemasangan</button>
+              </div>
+            ) : (
+              <div>
+                <p className="muted" style={{ marginTop: 0 }}>
+                  Jalankan perintah ini di mesin Linux baru sebagai root. Token di dalamnya khusus untuk node ini dan hanya tampil sekali di sini:
+                </p>
+                <pre className="logs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 150 }}>{enroll.command}</pre>
+                <button className="btn" style={{ width: "100%" }} onClick={copyEnroll}>Salin Perintah</button>
+                <p className="muted">
+                  Agent memasang dirinya sebagai service (dan Docker bila belum ada, syarat Panel Bot). Node muncul di sidebar dalam beberapa detik setelah perintah dijalankan.
+                </p>
+              </div>
+            )}
+            <button className="btn ghost" style={{ width: "100%", marginTop: 8 }}
+              onClick={() => { setEnroll(null); loadNodes(); }}>Tutup</button>
+          </div>
+        </div>
+      )}
 
       <nav className="tabs">
         {TABS.map(({ id, label, Icon }) => (
@@ -342,7 +456,7 @@ function FilesPane({ refreshKey }) {
                   <div className="grow">
                     {it.dir
                       ? <button className="nm" style={{ textAlign: "left", padding: 0 }} onClick={() => load(full)}>{it.name}</button>
-                      : <a className="nm" style={{ color: "inherit", textDecoration: "none" }} href={"/api/download?path=" + encodeURIComponent(full)}>{it.name}</a>}
+                      : <a className="nm" style={{ color: "inherit", textDecoration: "none" }} href={downloadUrl(full)}>{it.name}</a>}
                     <div className="meta">{it.dir ? "folder" : fmtBytes(it.size)}</div>
                   </div>
                 </div>
@@ -421,6 +535,7 @@ function ServicesPane({ refreshKey }) {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <select className="select" value={unit} onChange={(e) => { setUnit(e.target.value); loadLogs(e.target.value); }}>
               <option value="ruangnode-dashboard">ruangnode-dashboard</option>
+              <option value="ruangnode-agent">ruangnode-agent (connector)</option>
               <option value="cloudflared">cloudflared (tunnel)</option>
               <option value="tailscaled">tailscaled</option>
               <option value="ssh">ssh</option>

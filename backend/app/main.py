@@ -5,16 +5,17 @@ dan skema sesi dipertahankan persis, penyimpanan riwayat pindah ke
 SQLite, frontend adalah aplikasi React/Vite terpisah yang hasil
 build-nya dilayani dari folder frontend/dist.
 """
+import base64
 import os
 import subprocess
 import threading
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import bots, files as filemod, history, logs as logmod, system
+from . import bots, files as filemod, history, logs as logmod, nodes, system
 from .config import CFG, frontend_dist
 from .security import (COOKIE_NAME, brute_check, brute_clear, brute_record,
                        client_ip, is_authed, make_session, require_auth,
@@ -30,6 +31,8 @@ def _http_exc_handler(request: Request, exc: HTTPException):
                         content={"ok": False, "error": str(exc.detail)})
 
 MAX_UPLOAD = 1_073_741_824  # 1 GB
+MAX_REMOTE_FILE = 100 * 1024 * 1024  # transfer via agent dibatasi 100 MB
+ENROLL_RAW = "https://raw.githubusercontent.com/nexops993/RuangNode/main/connector/install.sh"
 
 
 def ok(data):
@@ -38,6 +41,22 @@ def ok(data):
 
 def err(code, msg):
     return JSONResponse(status_code=code, content={"ok": False, "error": msg})
+
+
+def valid_node(node):
+    """None bila node valid; respons error bila tidak."""
+    if node == nodes.LOCAL_ID:
+        return None
+    if nodes.get_node(node) is None:
+        return err(404, "node tidak ditemukan")
+    return None
+
+
+def remote_report_or_err(node):
+    rep_data = nodes.node_report(node)
+    if rep_data is None:
+        return None, err(503, "node belum melapor — pastikan agent ruangnode-agent menyala di node itu")
+    return rep_data, None
 
 
 # ---------------- autentikasi ----------------
@@ -72,16 +91,101 @@ def logout():
     return resp
 
 
+# ---------------- agent connector & node ----------------
+
+def _agent_auth(request: Request):
+    auth = request.headers.get("authorization") or ""
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    return nodes.auth_agent(token)
+
+
+@app.post("/api/agent/report")
+async def agent_report(request: Request):
+    node = _agent_auth(request)
+    if not node:
+        return err(401, "token node tidak dikenal")
+    data = await request.json()
+    nodes.save_report(node["id"], data if isinstance(data, dict) else {})
+    return ok({"saved": True})
+
+
+@app.post("/api/agent/poll")
+async def agent_poll(request: Request):
+    node = _agent_auth(request)
+    if not node:
+        return err(401, "token node tidak dikenal")
+    return ok({"commands": nodes.poll_commands(node["id"])})
+
+
+@app.post("/api/agent/result")
+async def agent_result(request: Request):
+    node = _agent_auth(request)
+    if not node:
+        return err(401, "token node tidak dikenal")
+    data = await request.json()
+    nodes.save_result(node["id"], data.get("id") or 0, bool(data.get("ok")),
+                      data.get("data"), data.get("error"))
+    return ok({"saved": True})
+
+
+@app.get("/api/nodes", dependencies=[Depends(require_auth)])
+def nodes_list():
+    with system.CACHE_LOCK:
+        cpu = system.CACHE["cpu_pct"]
+    mem = system.mem_info()
+    local_summary = {
+        "name": os.uname().nodename, "hostname": os.uname().nodename,
+        "os": "", "cpu_pct": cpu,
+        "mem_pct": round(100.0 * mem["used"] / mem["total"], 1) if mem["total"] else None,
+        "docker": bots.docker_ok("local"), "bots_dir": bots.BOTS_DIR,
+    }
+    return ok(nodes.nodes_overview(local_summary))
+
+
+@app.post("/api/nodes/enroll", dependencies=[Depends(require_auth)])
+async def nodes_enroll(request: Request):
+    data = await request.json()
+    made = nodes.create_enroll(str(data.get("name") or ""))
+    command = ("curl -fsSL %s | sudo bash -s -- --token %s" % (ENROLL_RAW, made["token"]))
+    return ok({"id": made["id"], "name": made["name"], "token": made["token"], "command": command})
+
+
+@app.post("/api/nodes/delete", dependencies=[Depends(require_auth)])
+async def nodes_delete(request: Request):
+    data = await request.json()
+    node = str(data.get("id") or "")
+    if node == nodes.LOCAL_ID or nodes.get_node(node) is None:
+        return err(400, "node tidak dikenal")
+    nodes.delete_node(node)
+    return ok({"deleted": True})
+
+
 # ---------------- status & service ----------------
 
 @app.get("/api/status", dependencies=[Depends(require_auth)])
-def status():
-    return ok(system.system_status())
+def status(node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node == nodes.LOCAL_ID:
+        return ok(system.system_status())
+    rep_data, bad = remote_report_or_err(node)
+    if bad:
+        return bad
+    return ok(rep_data)
 
 
 @app.get("/api/services", dependencies=[Depends(require_auth)])
-def services():
-    return ok(system.services_info())
+def services(node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node == nodes.LOCAL_ID:
+        return ok(system.services_info())
+    rep_data, bad = remote_report_or_err(node)
+    if bad:
+        return bad
+    return ok(rep_data.get("services") or [])
 
 
 @app.post("/api/service", dependencies=[Depends(require_auth)])
@@ -89,6 +193,31 @@ async def service_action(request: Request):
     data = await request.json()
     name = str(data.get("name") or "")
     action = str(data.get("action") or "")
+    node = str(data.get("node") or "local")
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node != nodes.LOCAL_ID:
+        rep_data, bad = remote_report_or_err(node)
+        if bad:
+            return bad
+        svcs = {s_["name"]: s_ for s_ in (rep_data.get("services") or [])}
+        if name not in svcs:
+            return err(400, "service tidak dikenal di node ini")
+        if action not in ("start", "stop", "restart"):
+            return err(400, "aksi tidak dikenal")
+        mode = svcs[name].get("mode")
+        if mode == "status-only":
+            return err(403, "service ini hanya bisa dipantau dari dashboard")
+        if mode == "restart-only" and action != "restart":
+            return err(403, "service kritikal: hanya restart yang diizinkan (menghentikan memutus akses jarak jauh)")
+        okk, res, errmsg = nodes.call(
+            node, "run", {"cmd": "systemctl %s %s" % (action, name), "timeout": 30}, timeout=50)
+        if not okk or int((res or {}).get("code", 1)) != 0:
+            return err(500, ((res or {}).get("out") or errmsg or "gagal")[-200:])
+        _, res2, _ = nodes.call(
+            node, "run", {"cmd": "systemctl is-active %s" % name, "timeout": 10}, timeout=30)
+        return ok({"name": name, "status": ((res2 or {}).get("out") or "unknown").strip()})
     if name not in system.SERVICE_LIST or not system.unit_exists(name):
         return err(400, "service tidak dikenal")
     if action not in ("start", "stop", "restart"):
@@ -112,6 +241,16 @@ async def power(request: Request):
     if action not in ("reboot", "shutdown") or data.get("confirm") is not True:
         return err(400, "aksi daya butuh konfirmasi")
     verb = "reboot" if action == "reboot" else "poweroff"
+    node = str(data.get("node") or "local")
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node != nodes.LOCAL_ID:
+        okk, _, errmsg = nodes.call(
+            node, "run_detached", {"cmd": "sleep 2; systemctl %s" % verb}, timeout=25)
+        if not okk:
+            return err(502, errmsg or "node tidak menjawab")
+        return ok({"scheduled": action})
     subprocess.Popen(["sh", "-c", "sleep 2; systemctl %s" % verb])
     return ok({"scheduled": action})
 
@@ -119,34 +258,60 @@ async def power(request: Request):
 # ---------------- riwayat & log ----------------
 
 @app.get("/api/history", dependencies=[Depends(require_auth)])
-def history_api(hours: int = 24):
+def history_api(hours: int = 24, node: str = "local"):
     if hours not in (1, 6, 24, 168):
         hours = 24
-    return ok({"hours": hours, "points": history.query(hours)})
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node == nodes.LOCAL_ID:
+        return ok({"hours": hours, "points": history.query(hours)})
+    return ok({"hours": hours, "points": nodes.history_query(node, hours)})
 
 
 @app.get("/api/logs", dependencies=[Depends(require_auth)])
-def logs_api(unit: str = "ruangnode-dashboard", lines: int = 120):
-    if unit not in logmod.LOG_UNITS:
+def logs_api(unit: str = "ruangnode-dashboard", lines: int = 120, node: str = "local"):
+    if unit not in logmod.LOG_UNITS and unit != "ruangnode-agent":
         return err(400, "unit tidak dikenal")
-    try:
-        return ok({"unit": unit, "logs": logmod.system_logs(unit, lines)})
-    except Exception as ex:
-        return err(500, str(ex)[:200])
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node == nodes.LOCAL_ID:
+        try:
+            return ok({"unit": unit, "logs": logmod.system_logs(unit, lines)})
+        except Exception as ex:
+            return err(500, str(ex)[:200])
+    lines = max(20, min(400, int(lines)))
+    if unit == "sistem":
+        cmd = "journalctl -n %d --no-pager -o short-iso" % lines
+    else:
+        cmd = "journalctl -u %s -n %d --no-pager -o short-iso" % (unit, lines)
+    okk, res, errmsg = nodes.call(node, "run", {"cmd": cmd, "timeout": 25}, timeout=45)
+    if not okk:
+        return err(502, errmsg or "node tidak menjawab")
+    return ok({"unit": unit, "logs": str((res or {}).get("out") or "")[-12000:]})
 
 
 # ---------------- panel bot ----------------
 
 @app.get("/api/bots", dependencies=[Depends(require_auth)])
-def bots_list():
-    return ok(bots.bots_overview())
+def bots_list(node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    return ok(bots.bots_overview(node))
 
 
 @app.post("/api/bots/create", dependencies=[Depends(require_auth)])
 async def bots_create(request: Request):
     data = await request.json()
     env = data.get("env") if isinstance(data.get("env"), dict) else {}
+    node = str(data.get("node") or "local")
+    bad = valid_node(node)
+    if bad:
+        return bad
     bot, msg = bots.create_bot(
+        node,
         str(data.get("name") or ""), str(data.get("runtime") or ""),
         str(data.get("start_cmd") or ""), data.get("mem_limit_mb") or 512,
         data.get("auto_restart", True), env)
@@ -158,8 +323,8 @@ async def bots_create(request: Request):
 @app.post("/api/bots/action", dependencies=[Depends(require_auth)])
 async def bots_action(request: Request):
     data = await request.json()
-    done, msg = bots.bot_action(str(data.get("id") or ""), str(data.get("action") or ""),
-                                wipe=bool(data.get("wipe")))
+    done, msg = bots.bot_action(str(data.get("node") or "local"), str(data.get("id") or ""),
+                                str(data.get("action") or ""), wipe=bool(data.get("wipe")))
     if done:
         return ok({"done": True})
     return err(400, msg)
@@ -170,7 +335,7 @@ async def bots_config(request: Request):
     data = await request.json()
     env = data.get("env") if isinstance(data.get("env"), dict) else None
     done, msg = bots.update_config(
-        str(data.get("id") or ""),
+        str(data.get("node") or "local"), str(data.get("id") or ""),
         start_cmd=data.get("start_cmd"), mem_limit_mb=data.get("mem_limit_mb"),
         auto_restart=data.get("auto_restart"), env=env)
     if done:
@@ -179,8 +344,11 @@ async def bots_config(request: Request):
 
 
 @app.get("/api/bots/logs", dependencies=[Depends(require_auth)])
-def bots_logs(id: str = "", tail: int = 200):
-    logs = bots.bot_logs(id, tail)
+def bots_logs(id: str = "", tail: int = 200, node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    logs = bots.bot_logs(node, id, tail)
     if logs is None:
         return err(400, "bot tidak ditemukan")
     return ok({"id": id, "logs": logs})
@@ -189,7 +357,8 @@ def bots_logs(id: str = "", tail: int = 200):
 @app.post("/api/bots/exec", dependencies=[Depends(require_auth)])
 async def bots_exec(request: Request):
     data = await request.json()
-    done, out = bots.bot_exec(str(data.get("id") or ""), str(data.get("cmd") or ""))
+    done, out = bots.bot_exec(str(data.get("node") or "local"), str(data.get("id") or ""),
+                              str(data.get("cmd") or ""))
     if done:
         return ok({"output": out})
     return err(400, out)
@@ -198,20 +367,26 @@ async def bots_exec(request: Request):
 @app.post("/api/bots/install-deps", dependencies=[Depends(require_auth)])
 async def bots_install_deps(request: Request):
     data = await request.json()
-    if not bots.start_install_deps(str(data.get("id") or "")):
+    if not bots.start_install_deps(str(data.get("node") or "local"), str(data.get("id") or "")):
         return err(409, "install sedang berjalan atau bot tidak ditemukan")
     return ok({"started": True})
 
 
 @app.get("/api/bots/install-status", dependencies=[Depends(require_auth)])
-def bots_install_status(id: str = ""):
-    st = bots.install_status(id)
+def bots_install_status(id: str = "", node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    st = bots.install_status(node, id)
     return ok(st or {"state": "belum pernah"})
 
 
 @app.get("/api/bots/file", dependencies=[Depends(require_auth)])
-def bots_file_read(id: str = "", path: str = ""):
-    data, msg = bots.read_bot_file(id, path)
+def bots_file_read(id: str = "", path: str = "", node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
+    data, msg = bots.read_bot_file(node, id, path)
     if data is None:
         return err(400, msg)
     return ok(data)
@@ -220,8 +395,8 @@ def bots_file_read(id: str = "", path: str = ""):
 @app.post("/api/bots/file/save", dependencies=[Depends(require_auth)])
 async def bots_file_save(request: Request):
     data = await request.json()
-    done, msg = bots.save_bot_file(str(data.get("id") or ""), str(data.get("path") or ""),
-                                   data.get("content") or "")
+    done, msg = bots.save_bot_file(str(data.get("node") or "local"), str(data.get("id") or ""),
+                                   str(data.get("path") or ""), data.get("content") or "")
     if done:
         return ok({"saved": True})
     return err(400, msg)
@@ -230,7 +405,8 @@ async def bots_file_save(request: Request):
 @app.post("/api/bots/extract", dependencies=[Depends(require_auth)])
 async def bots_extract(request: Request):
     data = await request.json()
-    done, msg = bots.extract_zip(str(data.get("id") or ""), str(data.get("path") or ""))
+    done, msg = bots.extract_zip(str(data.get("node") or "local"), str(data.get("id") or ""),
+                                 str(data.get("path") or ""))
     if done:
         return ok({"message": msg})
     return err(400, msg)
@@ -239,8 +415,16 @@ async def bots_extract(request: Request):
 # ---------------- berkas ----------------
 
 @app.get("/api/files", dependencies=[Depends(require_auth)])
-def files_list(path: str = ""):
+def files_list(path: str = "", node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
     target = filemod.jail_path(path)
+    if node != nodes.LOCAL_ID:
+        okk, data, errmsg = nodes.call(node, "fs_list", {"path": target}, timeout=30)
+        if not okk:
+            return err(400, (errmsg or "folder tidak ada di node")[:200])
+        return ok({"path": target, "items": (data or {}).get("items") or []})
     if not os.path.isdir(target):
         return err(404, "folder tidak ada")
     try:
@@ -251,20 +435,86 @@ def files_list(path: str = ""):
 
 
 @app.get("/api/download", dependencies=[Depends(require_auth)])
-def files_download(path: str = ""):
+def files_download(path: str = "", node: str = "local"):
+    bad = valid_node(node)
+    if bad:
+        return bad
     target = filemod.jail_path(path)
     # /proc, /sys, /dev adalah filesystem virtual kernel, bukan file
     # tersimpan - mengunduhnya bisa menggantung; tolak dengan jelas.
     if filemod.is_virtual(target):
         return err(400, "filesystem virtual sistem tidak bisa diunduh")
+    if node != nodes.LOCAL_ID:
+        okk, st, errmsg = nodes.call(node, "fs_stat", {"path": target}, timeout=20)
+        if not okk or not st or not st.get("is_file"):
+            return err(404, "file tidak ada di node")
+        size = int(st.get("size") or 0)
+        if size > MAX_REMOTE_FILE:
+            return err(413, "file di node remote dibatasi 100 MB untuk diunduh lewat panel")
+        buf = bytearray()
+        offset = 0
+        while offset < size:
+            okk, chunk, errmsg = nodes.call(
+                node, "fs_read", {"path": target, "offset": offset, "length": 262144}, timeout=40)
+            if not okk:
+                return err(502, (errmsg or "gagal membaca file di node")[:200])
+            raw = base64.b64decode((chunk or {}).get("data_b64") or "")
+            if not raw:
+                break
+            buf.extend(raw)
+            offset += len(raw)
+        fname = os.path.basename(target)
+        return Response(content=bytes(buf), media_type="application/octet-stream",
+                        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(fname)})
     if not os.path.isfile(target):
         return err(404, "file tidak ada")
     return FileResponse(target, filename=os.path.basename(target))
 
 
 @app.post("/api/upload", dependencies=[Depends(require_auth)])
-async def files_upload(path: str = "", file: list[UploadFile] = File(...)):
+async def files_upload(path: str = "", node: str = "local", file: list[UploadFile] = File(...)):
     dest_dir = filemod.jail_path(path)
+    bad = valid_node(node)
+    if bad:
+        return bad
+    if node != nodes.LOCAL_ID:
+        okk, data, errmsg = nodes.call(node, "fs_list", {"path": dest_dir}, timeout=30)
+        if not okk:
+            return err(400, "folder tujuan tidak valid di node")
+        existing = {it["name"] for it in (data or {}).get("items") or []}
+        plan = []
+        for up in file:
+            fname = os.path.basename(unquote(up.filename or ""))
+            if not fname or fname.startswith("."):
+                continue
+            if fname in existing:
+                return err(409, "file '%s' sudah ada" % fname)
+            plan.append((up, fname))
+        if not plan:
+            return err(400, "tidak ada file yang diterima")
+        saved = []
+        for up, fname in plan:
+            content = await up.read()
+            if len(content) > MAX_REMOTE_FILE:
+                return err(413, "unggahan ke node remote dibatasi 100 MB per file")
+            dest = dest_dir.rstrip("/") + "/" + fname
+            first = True
+            if not content:
+                okk, _, errmsg = nodes.call(node, "fs_write",
+                                            {"path": dest, "data_b64": "", "append": False}, timeout=40)
+                if not okk:
+                    return err(502, (errmsg or "gagal menulis di node")[:200])
+            for i in range(0, len(content), 262144):
+                okk, _, errmsg = nodes.call(
+                    node, "fs_write",
+                    {"path": dest,
+                     "data_b64": base64.b64encode(content[i:i + 262144]).decode(),
+                     "append": not first}, timeout=40)
+                if not okk:
+                    return err(502, (errmsg or "gagal menulis di node")[:200])
+                first = False
+            saved.append(fname)
+        return ok({"saved": saved})
     if not os.path.isdir(dest_dir):
         return err(400, "folder tujuan tidak valid")
     # periksa semua nama dulu: satu konflik membatalkan seluruh unggahan
@@ -302,6 +552,7 @@ async def files_upload(path: str = "", file: list[UploadFile] = File(...)):
 @app.on_event("startup")
 def _startup():
     history.init_db()
+    nodes.init_db()
     bots.init_db()
     threading.Thread(target=system.sampler, daemon=True).start()
     threading.Thread(target=history.writer, daemon=True).start()

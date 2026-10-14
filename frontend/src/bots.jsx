@@ -1,5 +1,5 @@
 import React, { useCallback, useContext, useEffect, useRef, useState } from "react";
-import { api, postJSON, fmtBytes } from "./api";
+import { api, postJSON, fmtBytes, downloadUrl } from "./api";
 import * as I from "./icons";
 
 /* Konteks UI (toast & modal) dibagikan dari App lewat ui-context. */
@@ -428,7 +428,7 @@ function BotFiles({ bot }) {
               <div className="grow">
                 {it.dir
                   ? <button className="nm" style={{ textAlign: "left", padding: 0 }} onClick={() => load(childRel)}>{it.name}</button>
-                  : <a className="nm" style={{ color: "inherit", textDecoration: "none" }} href={"/api/download?path=" + encodeURIComponent(childAbs)}>{it.name}</a>}
+                  : <a className="nm" style={{ color: "inherit", textDecoration: "none" }} href={downloadUrl(childAbs)}>{it.name}</a>}
                 <div className="meta">{it.dir ? "folder" : fmtBytes(it.size)}</div>
               </div>
               {!it.dir && it.name.toLowerCase().endsWith(".zip") && (
