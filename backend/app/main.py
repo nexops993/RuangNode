@@ -14,6 +14,7 @@ from urllib.parse import quote, unquote
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from . import bots, files as filemod, history, logs as logmod, nodes, system
 from .config import CFG, frontend_dist
@@ -211,13 +212,18 @@ async def service_action(request: Request):
             return err(403, "service ini hanya bisa dipantau dari dashboard")
         if mode == "restart-only" and action != "restart":
             return err(403, "service kritikal: hanya restart yang diizinkan (menghentikan memutus akses jarak jauh)")
-        okk, res, errmsg = nodes.call(
-            node, "run", {"cmd": "systemctl %s %s" % (action, name), "timeout": 30}, timeout=50)
-        if not okk or int((res or {}).get("code", 1)) != 0:
-            return err(500, ((res or {}).get("out") or errmsg or "gagal")[-200:])
-        _, res2, _ = nodes.call(
-            node, "run", {"cmd": "systemctl is-active %s" % name, "timeout": 10}, timeout=30)
-        return ok({"name": name, "status": ((res2 or {}).get("out") or "unknown").strip()})
+        def _remote_service():
+            okk, res, errmsg = nodes.call(
+                node, "run", {"cmd": "systemctl %s %s" % (action, name), "timeout": 30}, timeout=50)
+            if not okk or int((res or {}).get("code", 1)) != 0:
+                return None, ((res or {}).get("out") or errmsg or "gagal")[-200:]
+            _, res2, _ = nodes.call(
+                node, "run", {"cmd": "systemctl is-active %s" % name, "timeout": 10}, timeout=30)
+            return ((res2 or {}).get("out") or "unknown").strip(), None
+        status_txt, errmsg2 = await run_in_threadpool(_remote_service)
+        if errmsg2:
+            return err(500, errmsg2)
+        return ok({"name": name, "status": status_txt})
     if name not in system.SERVICE_LIST or not system.unit_exists(name):
         return err(400, "service tidak dikenal")
     if action not in ("start", "stop", "restart"):
@@ -246,8 +252,8 @@ async def power(request: Request):
     if bad:
         return bad
     if node != nodes.LOCAL_ID:
-        okk, _, errmsg = nodes.call(
-            node, "run_detached", {"cmd": "sleep 2; systemctl %s" % verb}, timeout=25)
+        okk, _, errmsg = await run_in_threadpool(
+            nodes.call, node, "run_detached", {"cmd": "sleep 2; systemctl %s" % verb}, timeout=25)
         if not okk:
             return err(502, errmsg or "node tidak menjawab")
         return ok({"scheduled": action})
@@ -310,7 +316,8 @@ async def bots_create(request: Request):
     bad = valid_node(node)
     if bad:
         return bad
-    bot, msg = bots.create_bot(
+    bot, msg = await run_in_threadpool(
+        bots.create_bot,
         node,
         str(data.get("name") or ""), str(data.get("runtime") or ""),
         str(data.get("start_cmd") or ""), data.get("mem_limit_mb") or 512,
@@ -323,8 +330,9 @@ async def bots_create(request: Request):
 @app.post("/api/bots/action", dependencies=[Depends(require_auth)])
 async def bots_action(request: Request):
     data = await request.json()
-    done, msg = bots.bot_action(str(data.get("node") or "local"), str(data.get("id") or ""),
-                                str(data.get("action") or ""), wipe=bool(data.get("wipe")))
+    done, msg = await run_in_threadpool(
+        bots.bot_action, str(data.get("node") or "local"), str(data.get("id") or ""),
+        str(data.get("action") or ""), wipe=bool(data.get("wipe")))
     if done:
         return ok({"done": True})
     return err(400, msg)
@@ -334,7 +342,8 @@ async def bots_action(request: Request):
 async def bots_config(request: Request):
     data = await request.json()
     env = data.get("env") if isinstance(data.get("env"), dict) else None
-    done, msg = bots.update_config(
+    done, msg = await run_in_threadpool(
+        bots.update_config,
         str(data.get("node") or "local"), str(data.get("id") or ""),
         start_cmd=data.get("start_cmd"), mem_limit_mb=data.get("mem_limit_mb"),
         auto_restart=data.get("auto_restart"), env=env)
@@ -357,8 +366,9 @@ def bots_logs(id: str = "", tail: int = 200, node: str = "local"):
 @app.post("/api/bots/exec", dependencies=[Depends(require_auth)])
 async def bots_exec(request: Request):
     data = await request.json()
-    done, out = bots.bot_exec(str(data.get("node") or "local"), str(data.get("id") or ""),
-                              str(data.get("cmd") or ""))
+    done, out = await run_in_threadpool(
+        bots.bot_exec, str(data.get("node") or "local"), str(data.get("id") or ""),
+        str(data.get("cmd") or ""))
     if done:
         return ok({"output": out})
     return err(400, out)
@@ -367,7 +377,7 @@ async def bots_exec(request: Request):
 @app.post("/api/bots/install-deps", dependencies=[Depends(require_auth)])
 async def bots_install_deps(request: Request):
     data = await request.json()
-    if not bots.start_install_deps(str(data.get("node") or "local"), str(data.get("id") or "")):
+    if not await run_in_threadpool(bots.start_install_deps, str(data.get("node") or "local"), str(data.get("id") or "")):
         return err(409, "install sedang berjalan atau bot tidak ditemukan")
     return ok({"started": True})
 
@@ -395,8 +405,9 @@ def bots_file_read(id: str = "", path: str = "", node: str = "local"):
 @app.post("/api/bots/file/save", dependencies=[Depends(require_auth)])
 async def bots_file_save(request: Request):
     data = await request.json()
-    done, msg = bots.save_bot_file(str(data.get("node") or "local"), str(data.get("id") or ""),
-                                   str(data.get("path") or ""), data.get("content") or "")
+    done, msg = await run_in_threadpool(
+        bots.save_bot_file, str(data.get("node") or "local"), str(data.get("id") or ""),
+        str(data.get("path") or ""), data.get("content") or "")
     if done:
         return ok({"saved": True})
     return err(400, msg)
@@ -405,8 +416,9 @@ async def bots_file_save(request: Request):
 @app.post("/api/bots/extract", dependencies=[Depends(require_auth)])
 async def bots_extract(request: Request):
     data = await request.json()
-    done, msg = bots.extract_zip(str(data.get("node") or "local"), str(data.get("id") or ""),
-                                 str(data.get("path") or ""))
+    done, msg = await run_in_threadpool(
+        bots.extract_zip, str(data.get("node") or "local"), str(data.get("id") or ""),
+        str(data.get("path") or ""))
     if done:
         return ok({"message": msg})
     return err(400, msg)
@@ -471,6 +483,41 @@ def files_download(path: str = "", node: str = "local"):
     return FileResponse(target, filename=os.path.basename(target))
 
 
+
+def _remote_upload_all(node, dest_dir, files_data):
+    """Seluruh unggahan remote (RPC agent) — sinkron, dijalankan di
+    threadpool agar event loop tidak membeku selama menunggu agent."""
+    okk, data, errmsg = nodes.call(node, "fs_list", {"path": dest_dir}, timeout=30)
+    if not okk:
+        return err(400, "folder tujuan tidak valid di node")
+    existing = {it["name"] for it in (data or {}).get("items") or []}
+    for fname, _c in files_data:
+        if fname in existing:
+            return err(409, "file '%s' sudah ada" % fname)
+    saved = []
+    for fname, content in files_data:
+        if len(content) > MAX_REMOTE_FILE:
+            return err(413, "unggahan ke node remote dibatasi 100 MB per file")
+        dest = dest_dir.rstrip("/") + "/" + fname
+        if not content:
+            okk, _, errmsg = nodes.call(node, "fs_write",
+                                        {"path": dest, "data_b64": "", "append": False}, timeout=40)
+            if not okk:
+                return err(502, (errmsg or "gagal menulis di node")[:200])
+        first = True
+        for i in range(0, len(content), 262144):
+            okk, _, errmsg = nodes.call(
+                node, "fs_write",
+                {"path": dest,
+                 "data_b64": base64.b64encode(content[i:i + 262144]).decode(),
+                 "append": not first}, timeout=40)
+            if not okk:
+                return err(502, (errmsg or "gagal menulis di node")[:200])
+            first = False
+        saved.append(fname)
+    return ok({"saved": saved})
+
+
 @app.post("/api/upload", dependencies=[Depends(require_auth)])
 async def files_upload(path: str = "", node: str = "local", file: list[UploadFile] = File(...)):
     dest_dir = filemod.jail_path(path)
@@ -478,43 +525,15 @@ async def files_upload(path: str = "", node: str = "local", file: list[UploadFil
     if bad:
         return bad
     if node != nodes.LOCAL_ID:
-        okk, data, errmsg = nodes.call(node, "fs_list", {"path": dest_dir}, timeout=30)
-        if not okk:
-            return err(400, "folder tujuan tidak valid di node")
-        existing = {it["name"] for it in (data or {}).get("items") or []}
-        plan = []
+        files_data = []
         for up in file:
             fname = os.path.basename(unquote(up.filename or ""))
             if not fname or fname.startswith("."):
                 continue
-            if fname in existing:
-                return err(409, "file '%s' sudah ada" % fname)
-            plan.append((up, fname))
-        if not plan:
+            files_data.append((fname, await up.read()))
+        if not files_data:
             return err(400, "tidak ada file yang diterima")
-        saved = []
-        for up, fname in plan:
-            content = await up.read()
-            if len(content) > MAX_REMOTE_FILE:
-                return err(413, "unggahan ke node remote dibatasi 100 MB per file")
-            dest = dest_dir.rstrip("/") + "/" + fname
-            first = True
-            if not content:
-                okk, _, errmsg = nodes.call(node, "fs_write",
-                                            {"path": dest, "data_b64": "", "append": False}, timeout=40)
-                if not okk:
-                    return err(502, (errmsg or "gagal menulis di node")[:200])
-            for i in range(0, len(content), 262144):
-                okk, _, errmsg = nodes.call(
-                    node, "fs_write",
-                    {"path": dest,
-                     "data_b64": base64.b64encode(content[i:i + 262144]).decode(),
-                     "append": not first}, timeout=40)
-                if not okk:
-                    return err(502, (errmsg or "gagal menulis di node")[:200])
-                first = False
-            saved.append(fname)
-        return ok({"saved": saved})
+        return await run_in_threadpool(_remote_upload_all, node, dest_dir, files_data)
     if not os.path.isdir(dest_dir):
         return err(400, "folder tujuan tidak valid")
     # periksa semua nama dulu: satu konflik membatalkan seluruh unggahan
